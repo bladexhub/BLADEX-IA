@@ -1,0 +1,180 @@
+-- ============================================================
+-- PROVIDERS REMOTOS v2.0 (carga desde repositorio)
+-- ============================================================
+local PROVIDERS_URL = "https://raw.githubusercontent.com/bladexhub/BLADEX-IA/refs/heads/main/providers.json"
+local PROVIDERS_CACHE_FILE = "BLADEX_PROVIDERS_CACHE.json"
+
+-- Fallback embebido: SOLO modelos verificados, sin invenciones
+local DEFAULT_PROVIDERS_DATA = {
+    version = "builtin-2.0",
+    providers = {
+        gemini = { name = "Google Gemini", kind = "gemini",
+            endpoint = "https://generativelanguage.googleapis.com/v1beta/models/",
+            models = {"gemini-2.5-flash","gemini-2.5-flash-lite","gemini-2.0-flash","gemini-2.5-pro"},
+            fallbacks = {"gemini-2.5-flash","gemini-2.5-flash-lite","gemini-2.0-flash"} },
+        groq = { name = "Groq", kind = "openai",
+            endpoint = "https://api.groq.com/openai/v1",
+            models = {"llama-3.3-70b-versatile","llama-3.1-8b-instant","qwen-qwq-32b"},
+            fallbacks = {"llama-3.3-70b-versatile","llama-3.1-8b-instant"} },
+        deepseek = { name = "DeepSeek", kind = "openai",
+            endpoint = "https://api.deepseek.com/v1",
+            models = {"deepseek-v4-flash","deepseek-v4-pro"},
+            fallbacks = {"deepseek-v4-flash","deepseek-v4-pro"} },
+        openrouter = { name = "OpenRouter", kind = "openai",
+            endpoint = "https://openrouter.ai/api/v1",
+            models = {"deepseek/deepseek-r1-0528:free","google/gemini-2.0-flash-exp:free","openrouter/free"},
+            fallbacks = {"deepseek/deepseek-r1-0528:free","google/gemini-2.0-flash-exp:free"} },
+        mistral = { name = "Mistral AI", kind = "openai",
+            endpoint = "https://api.mistral.ai/v1",
+            models = {"mistral-large-latest","mistral-small-latest","codestral-latest"},
+            fallbacks = {"mistral-small-latest","codestral-latest"} },
+        xai = { name = "xAI Grok", kind = "openai",
+            endpoint = "https://api.x.ai/v1",
+            models = {"grok-4-1-fast-non-reasoning","grok-3-mini","grok-3"},
+            fallbacks = {"grok-4-1-fast-non-reasoning","grok-3-mini"} },
+        cerebras = { name = "Cerebras", kind = "openai",
+            endpoint = "https://api.cerebras.ai/v1",
+            models = {"gpt-oss-120b","llama3.1-8b"},
+            fallbacks = {"gpt-oss-120b","llama3.1-8b"} },
+        together = { name = "Together AI", kind = "openai",
+            endpoint = "https://api.together.xyz/v1",
+            models = {"meta-llama/Llama-3.3-70B-Instruct-Turbo","Qwen/Qwen2.5-Coder-32B-Instruct"},
+            fallbacks = {"meta-llama/Llama-3.3-70B-Instruct-Turbo"} },
+        nvidia = { name = "NVIDIA NIM", kind = "openai",
+            endpoint = "https://integrate.api.nvidia.com/v1",
+            models = {"meta/llama-3.3-70b-instruct","nvidia/nemotron-3-nano-30b-a3b"},
+            fallbacks = {"meta/llama-3.3-70b-instruct"} },
+        huggingface = { name = "Hugging Face", kind = "openai",
+            endpoint = "https://router.huggingface.co/v1",
+            models = {"Qwen/Qwen2.5-Coder-32B-Instruct"},
+            fallbacks = {"Qwen/Qwen2.5-Coder-32B-Instruct"} },
+    },
+    order = {"gemini","groq","deepseek","openrouter","mistral","xai",
+             "cerebras","together","nvidia","huggingface"},
+}
+
+-- Estado global
+local Providers = {}
+local PROVIDER_ORDER = {}
+local PROVIDERS_SOURCE = "builtin-2.0"
+local PROVIDERS_VERSION = "builtin-2.0"
+local MODEL_CACHE = {}
+
+-- Normaliza la data recibida (remota o default) al formato interno
+local function normalizeProvidersData(d)
+    if type(d) ~= "table" then return nil end
+    local provs = d.providers or d
+    if type(provs) ~= "table" then return nil end
+
+    local out = {}
+    for pid, cfg in pairs(provs) do
+        if type(cfg) == "table" then
+            out[pid] = {
+                name = tostring(cfg.name or pid),
+                kind = tostring(cfg.kind or "openai"),
+                endpoint = tostring(cfg.endpoint or ""),
+                models = type(cfg.models) == "table" and cfg.models or {},
+                fallbacks = type(cfg.fallbacks) == "table" and cfg.fallbacks or {},
+                discover = type(cfg.discover) == "table" and cfg.discover or nil,
+            }
+        end
+    end
+
+    local finalOrder = {}
+    if type(d.order) == "table" then
+        for _, pid in ipairs(d.order) do
+            if out[pid] then table.insert(finalOrder, pid) end
+        end
+        for pid in pairs(out) do
+            local found = false
+            for _, p in ipairs(finalOrder) do
+                if p == pid then found = true; break end
+            end
+            if not found then table.insert(finalOrder, pid) end
+        end
+    else
+        for pid in pairs(out) do table.insert(finalOrder, pid) end
+        table.sort(finalOrder)
+    end
+
+    return out, finalOrder, d.version or "unknown"
+end
+
+local function readProvidersCache()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return nil end
+    local ok, has = pcall(isfile, PROVIDERS_CACHE_FILE)
+    if not ok or not has then return nil end
+    local ok2, raw = pcall(readfile, PROVIDERS_CACHE_FILE)
+    if not ok2 or type(raw) ~= "string" or raw == "" then return nil end
+    local ok3, d = pcall(function() return HTTP:JSONDecode(raw) end)
+    return ok3 and d or nil
+end
+
+local function writeProvidersCache(data)
+    if type(writefile) ~= "function" then return end
+    local ok, enc = pcall(function() return HTTP:JSONEncode(data) end)
+    if ok then pcall(writefile, PROVIDERS_CACHE_FILE, enc) end
+end
+
+local function fetchProvidersRemote()
+    if type(game.HttpGet) ~= "function" then return nil, "sin game:HttpGet" end
+    local ok, body = pcall(game.HttpGet, game, PROVIDERS_URL)
+    if not ok then return nil, "HttpGet fallo: " .. tostring(body):sub(1, 120) end
+    if type(body) ~= "string" or #body < 50 then return nil, "respuesta vacia" end
+    local ok2, d = pcall(function() return HTTP:JSONDecode(body) end)
+    if not ok2 or type(d) ~= "table" then return nil, "JSON invalido" end
+    if type(d.providers) ~= "table" then return nil, "estructura no reconocida" end
+    return d, nil
+end
+
+local function applyProvidersData(rawData, source)
+    local provs, order, ver = normalizeProvidersData(rawData)
+    if not provs or not next(provs) then return false end
+    Providers = provs
+    PROVIDER_ORDER = order
+    PROVIDERS_SOURCE = source
+    PROVIDERS_VERSION = ver or "?"
+    return true
+end
+
+-- Carga inicial: remoto -> cache -> builtin
+do
+    local remoteData = fetchProvidersRemote()
+    if remoteData and applyProvidersData(remoteData, "remoto") then
+        writeProvidersCache(remoteData)
+    end
+    if not next(Providers) then
+        local cacheData = readProvidersCache()
+        if cacheData then applyProvidersData(cacheData, "cache") end
+    end
+    if not next(Providers) then
+        applyProvidersData(DEFAULT_PROVIDERS_DATA, "builtin-2.0")
+    end
+end
+
+local function reloadProviders()
+    local remoteData, err = fetchProvidersRemote()
+    if remoteData and applyProvidersData(remoteData, "remoto") then
+        writeProvidersCache(remoteData)
+        return true, "Providers remotos v" .. PROVIDERS_VERSION ..
+            " (" .. #PROVIDER_ORDER .. " proveedores)"
+    end
+    local cacheData = readProvidersCache()
+    if cacheData and applyProvidersData(cacheData, "cache") then
+        return false, "Sin conexion. Usando cache local"
+    end
+    applyProvidersData(DEFAULT_PROVIDERS_DATA, "builtin-2.0")
+    return false, "Sin conexion. Usando builtin (" .. tostring(err) .. ")"
+end
+
+-- Helpers expuestos
+local function providerList() return PROVIDER_ORDER end
+local function providerName(id)
+    return Providers[id] and Providers[id].name or tostring(id)
+end
+local function providerModels(id)
+    local p = Providers[id]; return p and p.models or {}
+end
+local function providerFallbacks(id)
+    local p = Providers[id]; return p and p.fallbacks or {}
+end
