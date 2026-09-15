@@ -1,0 +1,1408 @@
+-- BLADEX / DARK DEX - STANDALONE COPILOT
+-- Single-file Lua script.
+-- No require(), no external Lua modules and no Dark Dex module dependencies.
+-- Intended for a Roblox client/executor environment where this script is authorized to
+-- inspect the currently running DataModel. Remote AI requires a Gemini API key and
+-- an HTTP request function supplied by the execution environment.
+
+local G = (getgenv and getgenv()) or _G
+
+-- ============================================================
+-- Compatibility / services
+-- ============================================================
+
+local function safe(f, ...)
+    local ok, a, b, c = pcall(f, ...)
+    if ok then return a, b, c end
+    return nil, a
+end
+
+local HttpService = safe(function() return game:GetService("HttpService") end)
+local Players = safe(function() return game:GetService("Players") end)
+local CoreGui = safe(function() return game:GetService("CoreGui") end)
+local UserInputService = safe(function() return game:GetService("UserInputService") end)
+
+if not game or not HttpService or not Players then
+    error("BLADEX Copilot: Roblox services are unavailable.")
+end
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Prefer the executor request function, but never require one for local inspection.
+local REQUEST =
+    G.request or
+    G.http_request or
+    G.request_async or
+    (syn and syn.request) or
+    (http and http.request)
+
+-- ============================================================
+-- Configuration
+-- ============================================================
+
+local Config = {
+    Name = "BLADEX Copilot",
+    Model = "gemini-3.8-flash",
+    ApiKey = G.BLADEX_GEMINI_KEY or "",
+    MaxOutputTokens = 8192,
+    MaxIterations = 6,
+    MaxChildren = 80,
+    MaxSearchResults = 80,
+    MaxScriptChars = 12000,
+}
+
+-- Optional: set before executing:
+-- getgenv().BLADEX_GEMINI_KEY = "YOUR_KEY"
+
+-- ============================================================
+-- Runtime state
+-- ============================================================
+
+local State = {
+    History = {},
+    Busy = false,
+    Destroyed = false,
+    Gui = nil,
+    Chat = nil,
+    Input = nil,
+    Status = nil,
+    ApiKeyBox = nil,
+    ModelBox = nil,
+    Messages = {},
+}
+
+-- ============================================================
+-- DataModel helpers
+-- ============================================================
+
+local function instancePath(inst)
+    if not inst then return "nil" end
+
+    local parts = {}
+    local cur = inst
+    local guard = 0
+
+    while cur and cur ~= game and guard < 80 do
+        guard += 1
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+
+    if cur == game then
+        return "game." .. table.concat(parts, ".")
+    end
+
+    return table.concat(parts, ".")
+end
+
+local function resolvePath(path)
+    if type(path) ~= "string" or path == "" then
+        return nil, "empty path"
+    end
+
+    if path == "game" then return game end
+    if path == "workspace" then return workspace end
+
+    local cur = game
+    local text = path
+
+    if text:sub(1, 5) == "game." then
+        text = text:sub(6)
+    elseif text:sub(1, 10) == "workspace." then
+        cur = workspace
+        text = text:sub(11)
+    end
+
+    for segment in string.gmatch(text, "([^%.]+)") do
+        local child = safe(function()
+            return cur:FindFirstChild(segment)
+        end)
+
+        if not child and cur == game then
+            child = safe(function()
+                return game:GetService(segment)
+            end)
+        end
+
+        if not child then
+            return nil, "not found: " .. segment
+        end
+
+        cur = child
+    end
+
+    return cur
+end
+
+local function serialize(value, depth)
+    depth = depth or 0
+    if depth > 3 then return "<depth-limit>" end
+
+    local kind = typeof(value)
+
+    if kind == "Instance" then
+        return instancePath(value)
+    elseif kind == "Vector3" then
+        return {x=value.X, y=value.Y, z=value.Z}
+    elseif kind == "Vector2" then
+        return {x=value.X, y=value.Y}
+    elseif kind == "CFrame" then
+        local p = value.Position
+        return {x=p.X, y=p.Y, z=p.Z}
+    elseif kind == "Color3" then
+        return {r=value.R, g=value.G, b=value.B}
+    elseif kind == "EnumItem" then
+        return tostring(value)
+    elseif kind == "table" then
+        local out = {}
+        local n = 0
+        for k,v in pairs(value) do
+            n += 1
+            if n > 40 then
+                out["..."] = "truncated"
+                break
+            end
+            out[tostring(k)] = serialize(v, depth + 1)
+        end
+        return out
+    end
+
+    if type(value) == "number" or type(value) == "string" or type(value) == "boolean" then
+        return value
+    end
+
+    return tostring(value)
+end
+
+local function listChildren(path)
+    local inst, err = resolvePath(path or "game")
+    if not inst then return {error=err} end
+
+    local result = {
+        path = instancePath(inst),
+        name = inst.Name,
+        class = inst.ClassName,
+        children = {},
+    }
+
+    local children = safe(function() return inst:GetChildren() end) or {}
+    table.sort(children, function(a,b) return a.Name:lower() < b.Name:lower() end)
+
+    for i, child in ipairs(children) do
+        if i > Config.MaxChildren then
+            result.truncated = true
+            break
+        end
+
+        table.insert(result.children, {
+            name = child.Name,
+            class = child.ClassName,
+            path = instancePath(child),
+        })
+    end
+
+    return result
+end
+
+local function getProperties(path, names)
+    local inst, err = resolvePath(path)
+    if not inst then return {error=err} end
+
+    local wanted = {}
+    if type(names) == "table" then
+        for _,n in ipairs(names) do wanted[tostring(n)] = true end
+    end
+
+    local defaults = {
+        "Name", "ClassName", "Parent", "Archivable",
+        "Position", "Size", "CFrame", "Anchored",
+        "CanCollide", "Transparency", "Visible",
+        "Enabled", "Value", "Text", "DisplayName",
+        "Health", "MaxHealth", "WalkSpeed", "JumpPower",
+    }
+
+    local result = {
+        path = instancePath(inst),
+        class = inst.ClassName,
+        properties = {},
+    }
+
+    local list = #names > 0 and names or defaults
+
+    for _, property in ipairs(list) do
+        if property ~= "ClassName" then
+            local ok, value = pcall(function()
+                return inst[property]
+            end)
+            if ok then
+                result.properties[property] = serialize(value)
+            end
+        end
+    end
+
+    result.properties.ClassName = inst.ClassName
+    return result
+end
+
+local function getAttributes(path)
+    local inst, err = resolvePath(path)
+    if not inst then return {error=err} end
+
+    local ok, attrs = pcall(function() return inst:GetAttributes() end)
+    if not ok then return {error=tostring(attrs)} end
+
+    return {
+        path = instancePath(inst),
+        attributes = serialize(attrs),
+    }
+end
+
+local function getCFrame(path)
+    local inst, err = resolvePath(path)
+    if not inst then return {error=err} end
+
+    local ok, cf = pcall(function() return inst.CFrame end)
+    if not ok then return {error="instance has no readable CFrame"} end
+
+    return {
+        path = instancePath(inst),
+        cframe = serialize(cf),
+    }
+end
+
+local function searchInstances(query, className)
+    query = tostring(query or ""):lower()
+    if query == "" then return {error="empty search query"} end
+
+    local results = {}
+    local descendants = safe(function() return game:GetDescendants() end) or {}
+
+    for _, inst in ipairs(descendants) do
+        if #results >= Config.MaxSearchResults then break end
+
+        local nameMatch = string.find(inst.Name:lower(), query, 1, true) ~= nil
+        local classMatch = (not className or className == "" or inst.ClassName == className)
+
+        if nameMatch and classMatch then
+            table.insert(results, {
+                name = inst.Name,
+                class = inst.ClassName,
+                path = instancePath(inst),
+            })
+        end
+    end
+
+    return {
+        query = query,
+        count = #results,
+        results = results,
+        truncated = #results >= Config.MaxSearchResults,
+    }
+end
+
+local function getSelected()
+    -- Optional integration with common selection globals.
+    local selected =
+        G.BLADEX_SELECTED_INSTANCE or
+        G.SelectedInstance or
+        G.Selected
+
+    if typeof(selected) == "Instance" then
+        return {
+            path = instancePath(selected),
+            name = selected.Name,
+            class = selected.ClassName,
+        }
+    end
+
+    return {error="no compatible selection provider is available"}
+end
+
+local function getGameInfo()
+    local info = {
+        place_id = game.PlaceId,
+        game_id = game.GameId,
+        job_id = game.JobId,
+        place_name = "unknown",
+        creator = "unknown",
+        player_count = #Players:GetPlayers(),
+    }
+
+    local MarketplaceService = safe(function()
+        return game:GetService("MarketplaceService")
+    end)
+
+    if MarketplaceService then
+        local ok, data = pcall(function()
+            return MarketplaceService:GetProductInfo(game.PlaceId)
+        end)
+
+        if ok and type(data) == "table" then
+            info.place_name = data.Name or info.place_name
+            info.creator = data.Creator and (data.Creator.Name or tostring(data.Creator.Id)) or info.creator
+            info.description = data.Description
+        end
+    end
+
+    return info
+end
+
+local function getLocalPlayer()
+    if not LocalPlayer then return {error="LocalPlayer unavailable"} end
+
+    local out = {
+        name = LocalPlayer.Name,
+        display_name = LocalPlayer.DisplayName,
+        user_id = LocalPlayer.UserId,
+        team = nil,
+    }
+
+    pcall(function()
+        if LocalPlayer.Team then out.team = LocalPlayer.Team.Name end
+    end)
+
+    local character = LocalPlayer.Character
+    if character then
+        out.character = instancePath(character)
+
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            out.health = humanoid.Health
+            out.max_health = humanoid.MaxHealth
+            out.walk_speed = humanoid.WalkSpeed
+            out.jump_power = humanoid.JumpPower
+        end
+
+        local root = character:FindFirstChild("HumanoidRootPart")
+        if root then
+            out.position = serialize(root.Position)
+        end
+    end
+
+    return out
+end
+
+-- Script source is executor-dependent. We only use read-only providers if available.
+local function getScriptSource(path)
+    local inst, err = resolvePath(path)
+    if not inst then return {error=err} end
+
+    local supported =
+        inst:IsA("LocalScript") or
+        inst:IsA("ModuleScript") or
+        inst:IsA("Script")
+
+    if not supported then
+        return {error="target is not a Script, LocalScript or ModuleScript"}
+    end
+
+    local providers = {
+        G.getscript,
+        G.decompile,
+        G.get_script_source,
+    }
+
+    for _, provider in ipairs(providers) do
+        if type(provider) == "function" then
+            local ok, source = pcall(provider, inst)
+            if ok and type(source) == "string" and #source > 0 then
+                if #source > Config.MaxScriptChars then
+                    source = source:sub(1, Config.MaxScriptChars) ..
+                        "\n-- [truncated by BLADEX Copilot]"
+                end
+
+                return {
+                    path = instancePath(inst),
+                    class = inst.ClassName,
+                    source = source,
+                }
+            end
+        end
+    end
+
+    return {
+        path = instancePath(inst),
+        class = inst.ClassName,
+        error="No compatible read-only script-source provider is exposed by this environment.",
+    }
+end
+
+-- ============================================================
+-- Tool registry
+-- ============================================================
+
+local Tools = {
+    list_children = {
+        description = "List direct children of a DataModel instance.",
+        parameters = {
+            type="object",
+            properties={path={type="string", description="Instance path, e.g. game.Workspace"}},
+        },
+        run=function(args) return listChildren(args.path or "game") end,
+    },
+
+    get_properties = {
+        description = "Read selected properties from an Instance.",
+        parameters = {
+            type="object",
+            properties={
+                path={type="string"},
+                names={type="array", items={type="string"}},
+            },
+        },
+        run=function(args) return getProperties(args.path, args.names or {}) end,
+    },
+
+    get_attributes = {
+        description = "Read Instance attributes.",
+        parameters = {
+            type="object",
+            properties={path={type="string"}},
+        },
+        run=function(args) return getAttributes(args.path) end,
+    },
+
+    get_cframe = {
+        description = "Read the CFrame of a BasePart-like instance.",
+        parameters = {
+            type="object",
+            properties={path={type="string"}},
+        },
+        run=function(args) return getCFrame(args.path) end,
+    },
+
+    search = {
+        description = "Search the DataModel recursively by instance name.",
+        parameters = {
+            type="object",
+            properties={
+                query={type="string"},
+                className={type="string"},
+            },
+        },
+        run=function(args) return searchInstances(args.query, args.className) end,
+    },
+
+    get_script_source = {
+        description = "Read script source when a compatible read-only provider is exposed.",
+        parameters = {
+            type="object",
+            properties={path={type="string"}},
+        },
+        run=function(args) return getScriptSource(args.path) end,
+    },
+
+    get_selected = {
+        description = "Get the currently selected instance when a selection provider is available.",
+        parameters={type="object", properties={}},
+        run=function() return getSelected() end,
+    },
+
+    get_game_info = {
+        description = "Get metadata about the current Roblox place.",
+        parameters={type="object", properties={}},
+        run=function() return getGameInfo() end,
+    },
+
+    get_local_player = {
+        description = "Get local player runtime information.",
+        parameters={type="object", properties={}},
+        run=function() return getLocalPlayer() end,
+    },
+}
+
+local function toolDeclarations()
+    local declarations = {}
+
+    for name, tool in pairs(Tools) do
+        table.insert(declarations, {
+            name=name,
+            description=tool.description,
+            parameters=tool.parameters,
+        })
+    end
+
+    return {{function_declarations=declarations}}
+end
+
+-- ============================================================
+-- JSON / Gemini transport
+-- ============================================================
+
+local SystemPrompt = [[
+You are BLADEX Copilot, a read-only Roblox runtime inspection assistant.
+
+You are connected to the currently running DataModel. Use the supplied tools instead
+of guessing. Inspect progressively: start with the smallest useful query, then chain
+additional read-only calls when necessary.
+
+You can inspect:
+- DataModel hierarchy
+- instance names/classes
+- selected properties and attributes
+- CFrames
+- name-based searches
+- game metadata
+- local-player runtime information
+- script source only when the execution environment exposes a read-only provider
+
+Never claim that a value was inspected if a tool did not return it.
+Keep tool arguments small and focused.
+Reply in the user's language.
+]]
+
+local GEMINI_MODELS = {
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+}
+
+local function normalizeResponse(response)
+    if type(response) ~= "table" then
+        return 0, ""
+    end
+    local status = tonumber(response.StatusCode or response.Status or response.status_code or 0) or 0
+    local raw = response.Body or response.body or response.ResponseBody or ""
+    return status, tostring(raw)
+end
+
+local function requestGeminiWithModel(model, contents)
+    local url =
+        "https://generativelanguage.googleapis.com/v1beta/models/" ..
+        tostring(model) ..
+        ":generateContent?key=" ..
+        tostring(Config.ApiKey)
+
+    local body = {
+        contents = contents,
+        systemInstruction = {parts = {{text = SystemPrompt}}},
+        tools = toolDeclarations(),
+        generationConfig = {
+            maxOutputTokens = Config.MaxOutputTokens,
+        },
+    }
+
+    local encoded = HttpService:JSONEncode(body)
+
+    local ok, response = pcall(REQUEST, {
+        Url = url,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["Accept"] = "application/json",
+        },
+        Body = encoded,
+    })
+
+    if not ok then
+        return nil, "HTTP request failed: " .. tostring(response), 0
+    end
+
+    local status, raw = normalizeResponse(response)
+
+    if status >= 400 then
+        return nil, raw:sub(1, 500), status
+    end
+
+    local decodeOk, decoded = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+
+    if not decodeOk or type(decoded) ~= "table" then
+        return nil, "The API returned invalid JSON.", status
+    end
+
+    if decoded.error then
+        local msg = decoded.error.message or tostring(decoded.error)
+        return nil, tostring(msg), status
+    end
+
+    return decoded, nil, status
+end
+
+local function requestGemini(contents)
+    if type(REQUEST) ~= "function" then
+        return nil, "HTTP request is not available in this environment."
+    end
+
+    if Config.ApiKey == "" then
+        return nil, "Gemini API key is empty."
+    end
+
+    local first = tostring(Config.Model or GEMINI_MODELS[1])
+    local candidates = {first}
+
+    for _, model in ipairs(GEMINI_MODELS) do
+        if model ~= first then
+            table.insert(candidates, model)
+        end
+    end
+
+    local lastError = "Unknown Gemini error."
+
+    for _, model in ipairs(candidates) do
+        local decoded, err, status = requestGeminiWithModel(model, contents)
+
+        if decoded then
+            Config.Model = model
+            return decoded
+        end
+
+        lastError = "HTTP " .. tostring(status) .. ": " .. tostring(err)
+
+        if status ~= 404 then
+            return nil, lastError
+        end
+    end
+
+    return nil, "No available Gemini model was found. Last error: " .. lastError
+end
+
+-- ============================================================
+-- Context fallback
+-- ============================================================
+
+local function buildLocalContext(message)
+    local lower = tostring(message):lower()
+    local context = {}
+
+    table.insert(context, {
+        type="game_info",
+        data=getGameInfo(),
+    })
+
+    -- Selected-instance requests
+    if lower:find("selected",1,true) or lower:find("seleccion",1,true) then
+        table.insert(context, {
+            type="selected",
+            data=getSelected(),
+        })
+    end
+
+    -- Common hierarchy questions
+    if lower:find("workspace",1,true) or
+       lower:find("children",1,true) or
+       lower:find("hijos",1,true) then
+        table.insert(context, {
+            type="workspace",
+            data=listChildren("game.Workspace"),
+        })
+    end
+
+    if lower:find("player",1,true) or lower:find("jugador",1,true) then
+        table.insert(context, {
+            type="local_player",
+            data=getLocalPlayer(),
+        })
+    end
+
+    return context
+end
+
+-- ============================================================
+-- Minimal markdown renderer
+-- ============================================================
+
+local function escapeRichText(s)
+    s = tostring(s or "")
+    s = s:gsub("&", "&amp;")
+    s = s:gsub("<", "&lt;")
+    s = s:gsub(">", "&gt;")
+    return s
+end
+
+local function markdown(text)
+    local s = escapeRichText(text)
+    s = s:gsub("```[%w_%-]*\n(.-)```", "<font face=\"Code\">%1</font>")
+    s = s:gsub("```(.-)```", "<font face=\"Code\">%1</font>")
+    s = s:gsub("`([^`\n]+)`", "<font face=\"Code\">%1</font>")
+    s = s:gsub("%*%*(.-)%*%*", "<b>%1</b>")
+    s = s:gsub("%*([^%*\n]+)%*", "<i>%1</i>")
+    return s
+end
+
+local function cleanUiText(text)
+    text = tostring(text or "")
+    text = text:gsub("\226\128\166", "...")
+    text = text:gsub("\226\128\147", "-")
+    text = text:gsub("\226\128\148", "-")
+    text = text:gsub("\226\128\152", "'")
+    text = text:gsub("\226\128\153", "'")
+    text = text:gsub("\226\128\156", "\"")
+    text = text:gsub("\226\128\157", "\"")
+    text = text:gsub("\226\128\162", "-")
+    text = text:gsub("\194\160", " ")
+    return text
+end
+
+-- ============================================================
+-- GUI
+-- ============================================================
+
+local function getGuiParent()
+    if type(gethui) == "function" then
+        local ok, gui = pcall(gethui)
+        if ok and gui then return gui end
+    end
+
+    return CoreGui or LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local function addCorner(obj, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = obj
+end
+
+local function setStatus(text)
+    if State.Status then
+        State.Status.Text = tostring(text or "")
+    end
+end
+
+local function addMessage(kind, text)
+    if not State.Chat then return end
+
+    text = cleanUiText(text)
+
+    local row = Instance.new("Frame")
+    row.Name = kind == "user" and "UserMessage" or "CopilotMessage"
+    row.BackgroundTransparency = 1
+    row.BorderSizePixel = 0
+    row.Size = UDim2.new(1, -16, 0, 0)
+    row.AutomaticSize = Enum.AutomaticSize.Y
+    row.Parent = State.Chat
+
+    local bubble = Instance.new("Frame")
+    bubble.BorderSizePixel = 0
+    bubble.AutomaticSize = Enum.AutomaticSize.Y
+    bubble.Size = UDim2.new(0.78, 0, 0, 0)
+    bubble.Parent = row
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 14)
+    corner.Parent = bubble
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Transparency = 0.55
+    stroke.Parent = bubble
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.BorderSizePixel = 0
+    label.Font = Enum.Font.Gotham
+    label.TextSize = 13
+    label.TextWrapped = true
+    label.RichText = kind == "bot"
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Top
+    label.AutomaticSize = Enum.AutomaticSize.Y
+    label.Size = UDim2.new(1, -24, 0, 0)
+    label.Position = UDim2.new(0, 12, 0, 9)
+    label.Text = kind == "bot" and markdown(text) or escapeRichText(text)
+    label.Parent = bubble
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingBottom = UDim.new(0, 9)
+    padding.Parent = label
+
+    if kind == "user" then
+        bubble.AnchorPoint = Vector2.new(1, 0)
+        bubble.Position = UDim2.new(1, 0, 0, 0)
+        bubble.BackgroundColor3 = Color3.fromRGB(10, 132, 255)
+        stroke.Color = Color3.fromRGB(55, 160, 255)
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    else
+        bubble.AnchorPoint = Vector2.new(0, 0)
+        bubble.Position = UDim2.new(0, 0, 0, 0)
+        bubble.BackgroundColor3 = Color3.fromRGB(36, 36, 44)
+        stroke.Color = Color3.fromRGB(70, 70, 82)
+        label.TextColor3 = Color3.fromRGB(236, 236, 240)
+    end
+
+    task.defer(function()
+        if State.Chat then
+            State.Chat.CanvasPosition =
+                Vector2.new(0, math.max(0, State.Chat.AbsoluteCanvasSize.Y))
+        end
+    end)
+end
+
+local function clearChat()
+    State.History = {}
+    State.Messages = {}
+
+    if State.Chat then
+        for _, child in ipairs(State.Chat:GetChildren()) do
+            if child:IsA("Frame") then
+                child:Destroy()
+            end
+        end
+    end
+end
+
+local function destroy()
+    State.Destroyed = true
+    if State.Gui then
+        State.Gui:Destroy()
+    end
+    G.BLADEX_COPILOT = nil
+end
+
+-- ============================================================
+-- Agent loop
+-- ============================================================
+
+local function runAgent(message)
+    if State.Busy then return end
+
+    State.Busy = true
+    setStatus("Thinking...")
+
+    if Config.ApiKey == "" then
+        addMessage("bot",
+            "Warning: Configura tu Gemini API key en el campo superior.\n" ..
+            "La inspeccion local del juego funciona sin API; la conversacion con el modelo requiere la clave.")
+        State.Busy = false
+        setStatus("")
+        return
+    end
+
+    table.insert(State.History, {
+        role="user",
+        parts={{text=message}},
+    })
+
+    local localContext = buildLocalContext(message)
+    if #localContext > 0 then
+        table.insert(State.History, {
+            role="user",
+            parts={{
+                text="Local runtime context:\n" ..
+                    HttpService:JSONEncode(localContext),
+            }},
+        })
+    end
+
+    for iteration=1,Config.MaxIterations do
+        if State.Destroyed then break end
+
+        setStatus("Thinking " .. tostring(iteration) .. "/" .. tostring(Config.MaxIterations) .. "...")
+
+        local decoded, err = requestGemini(State.History)
+        if not decoded then
+            addMessage("bot", "Warning: " .. tostring(err))
+            break
+        end
+
+        local candidate = decoded.candidates and decoded.candidates[1]
+        local parts = candidate and candidate.content and candidate.content.parts
+
+        if type(parts) ~= "table" then
+            addMessage("bot", "Warning: Gemini returned an empty response.")
+            break
+        end
+
+        local textOut = {}
+        local calls = {}
+
+        for _, part in ipairs(parts) do
+            if part.text then
+                table.insert(textOut, part.text)
+            end
+
+            if part.functionCall then
+                table.insert(calls, part.functionCall)
+            end
+        end
+
+        table.insert(State.History, {
+            role="model",
+            parts=parts,
+        })
+
+        if #textOut > 0 then
+            addMessage("bot", table.concat(textOut,"\n"))
+        end
+
+        if #calls == 0 then
+            break
+        end
+
+        local responseParts = {}
+
+        for _, call in ipairs(calls) do
+            local name = call.name
+            local args = call.args or {}
+            local tool = Tools[name]
+
+            addMessage("tool",
+                "> " .. tostring(name) .. " " ..
+                HttpService:JSONEncode(args):sub(1,300))
+
+            setStatus("Inspecting: " .. tostring(name))
+
+            local result
+
+            if not tool then
+                result = {error="unknown tool: " .. tostring(name)}
+            else
+                local ok, output = pcall(tool.run, args)
+                if ok then
+                    result = output
+                else
+                    result = {error=tostring(output)}
+                end
+            end
+
+            table.insert(responseParts, {
+                functionResponse={
+                    name=name,
+                    response={content=result},
+                },
+            })
+        end
+
+        table.insert(State.History, {
+            role="user",
+            parts=responseParts,
+        })
+    end
+
+    State.Busy = false
+    setStatus("")
+end
+
+local function send()
+    if State.Busy or State.Destroyed or not State.Input then return end
+
+    local text = State.Input.Text
+    if not text or text:gsub("%s","") == "" then return end
+
+    State.Input.Text = ""
+    addMessage("user", text)
+
+    task.spawn(function()
+        runAgent(text)
+    end)
+end
+
+-- ============================================================
+-- Build standalone GUI
+-- ============================================================
+
+local function buildGui()
+    local parent = getGuiParent()
+    local old = parent:FindFirstChild("BLADEX_COPILOT_STANDALONE")
+    if old then old:Destroy() end
+
+    local ThemeText = Color3.fromRGB(236, 236, 240)
+    local ThemeSubtle = Color3.fromRGB(165, 165, 176)
+    local ThemeAccent = Color3.fromRGB(10, 132, 255)
+    local ThemeBg = Color3.fromRGB(22, 22, 28)
+    local ThemePanel = Color3.fromRGB(26, 26, 32)
+    local ThemeInput = Color3.fromRGB(32, 32, 40)
+    local ThemeBorder = Color3.fromRGB(55, 55, 66)
+
+    -- No external image assets are used here.
+    -- This removes the image 404s while keeping the Dark Dex visual language.
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "BLADEX_COPILOT_STANDALONE"
+    gui.IgnoreGuiInset = true
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = parent
+    State.Gui = gui
+
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Active = true
+    main.BackgroundColor3 = ThemeBg
+    main.BorderSizePixel = 0
+    main.Position = UDim2.new(0.5, -210, 0.5, -260)
+    main.Size = UDim2.fromOffset(420, 520)
+    main.Parent = gui
+    addCorner(main, 16)
+
+    local mainStroke = Instance.new("UIStroke")
+    mainStroke.Color = ThemeBorder
+    mainStroke.Thickness = 1
+    mainStroke.Transparency = 0.25
+    mainStroke.Parent = main
+
+    local topBar = Instance.new("Frame")
+    topBar.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    topBar.BorderSizePixel = 0
+    topBar.Size = UDim2.new(1, 0, 0, 44)
+    topBar.Parent = main
+    addCorner(topBar, 16)
+
+    local topMask = Instance.new("Frame")
+    topMask.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    topMask.BorderSizePixel = 0
+    topMask.Position = UDim2.new(0, 0, 1, -16)
+    topMask.Size = UDim2.new(1, 0, 0, 16)
+    topMask.Parent = topBar
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamMedium
+    title.TextSize = 13
+    title.TextColor3 = ThemeText
+    title.Text = "AI Copilot"
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Position = UDim2.fromOffset(14, 0)
+    title.Size = UDim2.new(1, -110, 1, 0)
+    title.Parent = topBar
+
+    local close = Instance.new("TextButton")
+    close.BackgroundColor3 = Color3.fromRGB(120, 60, 66)
+    close.BorderSizePixel = 0
+    close.Text = "X"
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 11
+    close.TextColor3 = ThemeText
+    close.AutoButtonColor = false
+    close.Position = UDim2.new(1, -42, 0, 10)
+    close.Size = UDim2.fromOffset(28, 24)
+    close.Parent = topBar
+    addCorner(close, 10)
+    close.MouseButton1Click:Connect(destroy)
+
+    local minimize = Instance.new("TextButton")
+    minimize.BackgroundColor3 = Color3.fromRGB(55, 55, 66)
+    minimize.BorderSizePixel = 0
+    minimize.Text = "-"
+    minimize.Font = Enum.Font.GothamBold
+    minimize.TextSize = 15
+    minimize.TextColor3 = ThemeText
+    minimize.AutoButtonColor = false
+    minimize.Position = UDim2.new(1, -76, 0, 10)
+    minimize.Size = UDim2.fromOffset(28, 24)
+    minimize.Parent = topBar
+    addCorner(minimize, 10)
+
+    local content = Instance.new("Frame")
+    content.BackgroundColor3 = ThemeBg
+    content.BorderSizePixel = 0
+    content.Position = UDim2.fromOffset(0, 44)
+    content.Size = UDim2.new(1, 0, 1, -44)
+    content.Parent = main
+
+    local tabs = Instance.new("Frame")
+    tabs.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    tabs.BorderSizePixel = 0
+    tabs.Size = UDim2.new(1, 0, 0, 38)
+    tabs.Parent = content
+
+    local tabNames = {"Explorer", "Props", "Console", "Info"}
+
+    for i, name in ipairs(tabNames) do
+        local tab = Instance.new("TextButton")
+        tab.BackgroundTransparency = 1
+        tab.BorderSizePixel = 0
+        tab.Text = name
+        tab.Font = Enum.Font.GothamMedium
+        tab.TextSize = 11
+        tab.TextColor3 = name == "Console" and ThemeText or Color3.fromRGB(115, 115, 128)
+        tab.AutoButtonColor = false
+        tab.Position = UDim2.new((i - 1) / 4, 0, 0, 0)
+        tab.Size = UDim2.new(0.25, 0, 1, 0)
+        tab.Parent = tabs
+
+        local underline = Instance.new("Frame")
+        underline.BackgroundColor3 = ThemeAccent
+        underline.BorderSizePixel = 0
+        underline.Position = UDim2.new(0, 10, 1, -3)
+        underline.Size = UDim2.new(1, -20, 0, 3)
+        underline.Visible = name == "Console"
+        underline.Parent = tab
+        addCorner(underline, 3)
+    end
+
+    local settings = Instance.new("Frame")
+    settings.BackgroundColor3 = ThemePanel
+    settings.BorderSizePixel = 0
+    settings.Position = UDim2.fromOffset(8, 46)
+    settings.Size = UDim2.new(1, -16, 0, 68)
+    settings.Parent = content
+    addCorner(settings, 14)
+
+    local modelLabel = Instance.new("TextLabel")
+    modelLabel.BackgroundTransparency = 1
+    modelLabel.Font = Enum.Font.GothamMedium
+    modelLabel.TextSize = 9
+    modelLabel.TextColor3 = ThemeSubtle
+    modelLabel.Text = "MODEL"
+    modelLabel.Position = UDim2.fromOffset(10, 6)
+    modelLabel.Size = UDim2.fromOffset(80, 12)
+    modelLabel.Parent = settings
+
+    local modelButton = Instance.new("TextButton")
+    modelButton.BackgroundColor3 = ThemeInput
+    modelButton.BorderSizePixel = 0
+    modelButton.Font = Enum.Font.Gotham
+    modelButton.TextSize = 10
+    modelButton.TextColor3 = ThemeText
+    modelButton.TextXAlignment = Enum.TextXAlignment.Left
+    modelButton.AutoButtonColor = false
+    modelButton.Position = UDim2.fromOffset(8, 22)
+    modelButton.Size = UDim2.new(0.48, -12, 0, 24)
+    modelButton.Parent = settings
+    addCorner(modelButton, 10)
+
+    local modelPad = Instance.new("UIPadding")
+    modelPad.PaddingLeft = UDim.new(0, 9)
+    modelPad.PaddingRight = UDim.new(0, 9)
+    modelPad.Parent = modelButton
+
+    local models = {
+        {Id = "gemini-3.8-flash", Label = "Gemini 3.8 Flash"},
+        {Id = "gemini-3.7-flash", Label = "Gemini 3.7 Flash"},
+        {Id = "gemini-3.6-flash", Label = "Gemini 3.6 Flash"},
+        {Id = "gemini-3.5-flash-lite", Label = "Gemini 3.5 Flash Lite"},
+    }
+
+    local function refreshModel()
+        for _, model in ipairs(models) do
+            if model.Id == Config.Model then
+                modelButton.Text = model.Label
+                return
+            end
+        end
+        modelButton.Text = Config.Model
+    end
+    refreshModel()
+
+    modelButton.MouseButton1Click:Connect(function()
+        local index = 1
+        for i, model in ipairs(models) do
+            if model.Id == Config.Model then
+                index = i
+                break
+            end
+        end
+        Config.Model = models[(index % #models) + 1].Id
+        refreshModel()
+    end)
+
+    local keyLabel = Instance.new("TextLabel")
+    keyLabel.BackgroundTransparency = 1
+    keyLabel.Font = Enum.Font.GothamMedium
+    keyLabel.TextSize = 9
+    keyLabel.TextColor3 = ThemeSubtle
+    keyLabel.Text = "API KEY"
+    keyLabel.Position = UDim2.new(0.5, 4, 0, 6)
+    keyLabel.Size = UDim2.new(0.5, -12, 0, 12)
+    keyLabel.Parent = settings
+
+    local keyBox = Instance.new("TextBox")
+    keyBox.BackgroundColor3 = ThemeInput
+    keyBox.BorderSizePixel = 0
+    keyBox.Font = Enum.Font.Code
+    keyBox.TextSize = 10
+    keyBox.TextColor3 = ThemeText
+    keyBox.PlaceholderText = "Gemini API key"
+    keyBox.PlaceholderColor3 = Color3.fromRGB(100, 100, 110)
+    keyBox.TextXAlignment = Enum.TextXAlignment.Left
+    keyBox.ClearTextOnFocus = false
+    keyBox.Text = Config.ApiKey
+    keyBox.Position = UDim2.new(0.5, 4, 0, 22)
+    keyBox.Size = UDim2.new(0.5, -12, 0, 24)
+    keyBox.Parent = settings
+    addCorner(keyBox, 10)
+
+    local keyPad = Instance.new("UIPadding")
+    keyPad.PaddingLeft = UDim.new(0, 9)
+    keyPad.PaddingRight = UDim.new(0, 9)
+    keyPad.Parent = keyBox
+    State.ApiKeyBox = keyBox
+
+    keyBox:GetPropertyChangedSignal("Text"):Connect(function()
+        Config.ApiKey = keyBox.Text
+        G.BLADEX_GEMINI_KEY = Config.ApiKey
+    end)
+
+    local clearButton = Instance.new("TextButton")
+    clearButton.BackgroundColor3 = ThemeInput
+    clearButton.BorderSizePixel = 0
+    clearButton.Font = Enum.Font.GothamMedium
+    clearButton.TextSize = 10
+    clearButton.TextColor3 = ThemeSubtle
+    clearButton.Text = "Clear"
+    clearButton.AutoButtonColor = false
+    clearButton.Position = UDim2.fromOffset(8, 126)
+    clearButton.Size = UDim2.fromOffset(58, 22)
+    clearButton.Parent = content
+    addCorner(clearButton, 9)
+    clearButton.MouseButton1Click:Connect(clearChat)
+
+    local status = Instance.new("TextLabel")
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 10
+    status.TextColor3 = ThemeAccent
+    status.TextXAlignment = Enum.TextXAlignment.Right
+    status.Text = ""
+    status.Position = UDim2.new(0, 74, 0, 126)
+    status.Size = UDim2.new(1, -82, 0, 22)
+    status.Parent = content
+    State.Status = status
+
+    local chat = Instance.new("ScrollingFrame")
+    chat.Name = "ChatMessages"
+    chat.BackgroundTransparency = 1
+    chat.BorderSizePixel = 0
+    chat.Position = UDim2.fromOffset(8, 154)
+    chat.Size = UDim2.new(1, -16, 1, -208)
+    chat.CanvasSize = UDim2.new()
+    chat.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    chat.ScrollBarThickness = 3
+    chat.ScrollBarImageColor3 = Color3.fromRGB(75, 75, 86)
+    chat.Parent = content
+    State.Chat = chat
+
+    local chatLayout = Instance.new("UIListLayout")
+    chatLayout.Padding = UDim.new(0, 7)
+    chatLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    chatLayout.Parent = chat
+
+    local chatPadding = Instance.new("UIPadding")
+    chatPadding.PaddingLeft = UDim.new(0, 2)
+    chatPadding.PaddingRight = UDim.new(0, 2)
+    chatPadding.PaddingTop = UDim.new(0, 5)
+    chatPadding.PaddingBottom = UDim.new(0, 5)
+    chatPadding.Parent = chat
+
+    local inputBar = Instance.new("Frame")
+    inputBar.BackgroundColor3 = ThemePanel
+    inputBar.BorderSizePixel = 0
+    inputBar.Position = UDim2.new(0, 8, 1, -48)
+    inputBar.Size = UDim2.new(1, -16, 0, 40)
+    inputBar.Parent = content
+    addCorner(inputBar, 14)
+
+    local input = Instance.new("TextBox")
+    input.BackgroundColor3 = ThemeInput
+    input.BorderSizePixel = 0
+    input.Font = Enum.Font.Gotham
+    input.TextSize = 12
+    input.TextColor3 = ThemeText
+    input.PlaceholderText = "Ask about the workspace, scripts, properties..."
+    input.PlaceholderColor3 = Color3.fromRGB(105, 105, 116)
+    input.TextXAlignment = Enum.TextXAlignment.Left
+    input.TextYAlignment = Enum.TextYAlignment.Center
+    input.ClearTextOnFocus = false
+    input.MultiLine = false
+    input.Position = UDim2.fromOffset(6, 6)
+    input.Size = UDim2.new(1, -76, 0, 28)
+    input.Parent = inputBar
+    addCorner(input, 11)
+
+    local inputPad = Instance.new("UIPadding")
+    inputPad.PaddingLeft = UDim.new(0, 10)
+    inputPad.PaddingRight = UDim.new(0, 10)
+    inputPad.Parent = input
+    State.Input = input
+
+    local sendButton = Instance.new("TextButton")
+    sendButton.BackgroundColor3 = ThemeAccent
+    sendButton.BorderSizePixel = 0
+    sendButton.Font = Enum.Font.GothamBold
+    sendButton.TextSize = 10
+    sendButton.TextColor3 = Color3.new(1, 1, 1)
+    sendButton.Text = "Send"
+    sendButton.AutoButtonColor = false
+    sendButton.Position = UDim2.new(1, -64, 0, 6)
+    sendButton.Size = UDim2.fromOffset(58, 28)
+    sendButton.Parent = inputBar
+    addCorner(sendButton, 11)
+    sendButton.MouseButton1Click:Connect(send)
+
+    input.FocusLost:Connect(function(enterPressed)
+        if enterPressed then send() end
+    end)
+
+    local minimized = false
+    minimize.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        content.Visible = not minimized
+        main.Size = minimized and UDim2.fromOffset(420, 44) or UDim2.fromOffset(420, 520)
+        minimize.Text = minimized and "+" or "-"
+    end)
+
+    local dragging = false
+    local dragStart
+    local startPosition
+
+    topBar.InputBegan:Connect(function(inputObject)
+        if inputObject.UserInputType == Enum.UserInputType.MouseButton1
+            or inputObject.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = inputObject.Position
+            startPosition = main.Position
+        end
+    end)
+
+    topBar.InputEnded:Connect(function(inputObject)
+        if inputObject.UserInputType == Enum.UserInputType.MouseButton1
+            or inputObject.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    if UserInputService then
+        UserInputService.InputChanged:Connect(function(inputObject)
+            if not dragging then return end
+
+            local valid =
+                inputObject.UserInputType == Enum.UserInputType.MouseMovement
+                or inputObject.UserInputType == Enum.UserInputType.Touch
+
+            if not valid then return end
+
+            local delta = inputObject.Position - dragStart
+            main.Position = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+        end)
+    end
+
+    addMessage("bot",
+        "BLADEX Copilot is ready. Set your Gemini API key above, then ask about " ..
+        "the current DataModel, workspace, instances, properties, scripts, or player state.")
+end
+-- ============================================================
+-- Public API
+-- ============================================================
+
+local Copilot = {
+    Config = Config,
+    State = State,
+    Tools = Tools,
+    Send = send,
+    Clear = clearChat,
+    Destroy = destroy,
+    GetGameInfo = getGameInfo,
+    GetLocalPlayer = getLocalPlayer,
+    ListChildren = listChildren,
+    Search = searchInstances,
+    GetProperties = getProperties,
+    GetAttributes = getAttributes,
+    GetCFrame = getCFrame,
+    GetScriptSource = getScriptSource,
+    GetSelected = getSelected,
+}
+
+G.BLADEX_COPILOT = Copilot
+
+buildGui()
+
+return Copilot
