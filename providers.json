@@ -1,0 +1,229 @@
+{
+  "version": "2.0",
+  "updated": "2026-09-15",
+  "providers": {
+    "gemini": {
+      "name": "Google Gemini",
+      "kind": "gemini",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/",
+      "models": [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b"
+      ],
+      "fallbacks": [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "https://generativelanguage.googleapis.com/v1beta/models?key={KEY}",
+        "stripPrefix": "models/"
+      }
+    },
+
+    "groq": {
+      "name": "Groq",
+      "kind": "openai",
+      "endpoint": "https://api.groq.com/openai/v1",
+      "models": [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "deepseek-r1-distill-llama-70b",
+        "qwen-qwq-32b",
+        "llama-3.1-70b-versatile",
+        "mixtral-8x7b-32768"
+      ],
+      "fallbacks": [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models"
+      }
+    },
+
+    "deepseek": {
+      "name": "DeepSeek",
+      "kind": "openai",
+      "endpoint": "https://api.deepseek.com/v1",
+      "models": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ],
+      "fallbacks": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models"
+      }
+    },
+
+    "openrouter": {
+      "name": "OpenRouter",
+      "kind": "openai",
+      "endpoint": "https://openrouter.ai/api/v1",
+      "models": [
+        "deepseek/deepseek-r1-0528:free",
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "qwen/qwen-2.5-72b-instruct:free",
+        "mistralai/mistral-small-3.1-24b-instruct:free",
+        "openrouter/free"
+      ],
+      "fallbacks": [
+        "deepseek/deepseek-r1-0528:free",
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.3-70b-instruct:free"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models",
+        "filter": ":free"
+      }
+    },
+
+    "mistral": {
+      "name": "Mistral AI",
+      "kind": "openai",
+      "endpoint": "https://api.mistral.ai/v1",
+      "models": [
+        "mistral-large-latest",
+        "mistral-small-latest",
+        "codestral-latest",
+        "open-mistral-nemo",
+        "ministral-8b-latest"
+      ],
+      "fallbacks": [
+        "mistral-small-latest",
+        "codestral-latest",
+        "mistral-large-latest"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models"
+      }
+    },
+
+    "xai": {
+      "name": "xAI Grok",
+      "kind": "openai",
+      "endpoint": "https://api.x.ai/v1",
+      "models": [
+        "grok-4-1-fast-reasoning",
+        "grok-4-1-fast-non-reasoning",
+        "grok-4-0709",
+        "grok-code-fast-1",
+        "grok-3",
+        "grok-3-mini"
+      ],
+      "fallbacks": [
+        "grok-4-1-fast-non-reasoning",
+        "grok-3-mini",
+        "grok-3"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models"
+      }
+    },
+
+    "cerebras": {
+      "name": "Cerebras",
+      "kind": "openai",
+      "endpoint": "https://api.cerebras.ai/v1",
+      "models": [
+        "gpt-oss-120b",
+        "zai-glm-4.7",
+        "llama3.1-8b"
+      ],
+      "fallbacks": [
+        "gpt-oss-120b",
+        "llama3.1-8b"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models"
+      }
+    },
+
+    "together": {
+      "name": "Together AI",
+      "kind": "openai",
+      "endpoint": "https://api.together.xyz/v1",
+      "models": [
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "deepseek-ai/DeepSeek-V3",
+        "deepseek-ai/DeepSeek-R1-Distill-Llama-70B-free",
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+      ],
+      "fallbacks": [
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "Qwen/Qwen2.5-Coder-32B-Instruct"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models"
+      }
+    },
+
+    "nvidia": {
+      "name": "NVIDIA NIM",
+      "kind": "openai",
+      "endpoint": "https://integrate.api.nvidia.com/v1",
+      "models": [
+        "meta/llama-3.3-70b-instruct",
+        "nvidia/nemotron-3-nano-30b-a3b",
+        "qwen/qwen3-coder-480b-a35b-instruct",
+        "deepseek-ai/deepseek-r1"
+      ],
+      "fallbacks": [
+        "meta/llama-3.3-70b-instruct",
+        "nvidia/nemotron-3-nano-30b-a3b"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models"
+      }
+    },
+
+    "huggingface": {
+      "name": "Hugging Face",
+      "kind": "openai",
+      "endpoint": "https://router.huggingface.co/v1",
+      "models": [
+        "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "Qwen/Qwen2.5-72B-Instruct",
+        "meta-llama/Llama-3.3-70B-Instruct"
+      ],
+      "fallbacks": [
+        "Qwen/Qwen2.5-Coder-32B-Instruct"
+      ],
+      "discover": {
+        "enabled": true,
+        "url": "{ENDPOINT}/models"
+      }
+    }
+  },
+  "order": [
+    "gemini",
+    "groq",
+    "deepseek",
+    "openrouter",
+    "mistral",
+    "xai",
+    "cerebras",
+    "together",
+    "nvidia",
+    "huggingface"
+  ]
+}
